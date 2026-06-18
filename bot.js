@@ -1,7 +1,7 @@
 const mineflayer = require('mineflayer');
 
 const HOST = 'villain.falixsrv.me';
-const PORT = 20092;
+const PORT = 48424;
 const USERNAME = 'StayAliveBot';
 const VERSION = false; // auto-detect
 
