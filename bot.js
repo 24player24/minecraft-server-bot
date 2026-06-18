@@ -1,10 +1,12 @@
+const http = require('http');
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements } = require('mineflayer-pathfinder');
 const pvp = require('mineflayer-pvp').plugin;
 
 const HOST = 'villain.falixsrv.me';
-const PORT = 48424;
+const MC_PORT = 48424;
 const USERNAME = 'StayAliveBot';
+const HTTP_PORT = process.env.PORT || 3000; // Render injects PORT
 
 let bot = null;
 let reconnectTimer = null;
@@ -204,11 +206,11 @@ function handleCommand(username, message) {
 function createBot() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-  log(`Connecting to ${HOST}:${PORT} as ${USERNAME}...`);
+  log(`Connecting to ${HOST}:${MC_PORT} as ${USERNAME}...`);
 
   bot = mineflayer.createBot({
     host: HOST,
-    port: PORT,
+    port: MC_PORT,
     username: USERNAME,
     // FIX: removed VERSION=false — mineflayer rejects it; omit to auto-detect
     auth: 'offline',
@@ -329,6 +331,41 @@ process.on('uncaughtException', (err) => {
 // FIX: log unhandled rejections but don't blindly reconnect — they may be unrelated
 process.on('unhandledRejection', (reason) => {
   log(`Unhandled rejection: ${reason}`);
+});
+
+// ─── HTTP Status Server ───────────────────────────────────────────────────────
+// Required so Render keeps the process alive and UptimeRobot gets a 200 OK.
+
+const startTime = Date.now();
+
+http.createServer((req, res) => {
+  const uptime = Math.floor((Date.now() - startTime) / 1000);
+  const hh = String(Math.floor(uptime / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((uptime % 3600) / 60)).padStart(2, '0');
+  const ss = String(uptime % 60).padStart(2, '0');
+
+  const connected = bot && bot.entity ? 'ONLINE' : 'RECONNECTING';
+  const health    = bot && bot.health  != null ? bot.health.toFixed(1) : '?';
+  const food      = bot && bot.food    != null ? String(bot.food)      : '?';
+  const target    = currentTarget
+    ? (currentTarget.username || currentTarget.type)
+    : 'none';
+
+  const body = JSON.stringify({
+    status:   connected,
+    server:   `${HOST}:${MC_PORT}`,
+    username: USERNAME,
+    pvpMode,
+    health,
+    food,
+    target,
+    uptime:   `${hh}:${mm}:${ss}`,
+  }, null, 2);
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(body);
+}).listen(HTTP_PORT, () => {
+  log(`🌐 Status server listening on port ${HTTP_PORT} (for Render + UptimeRobot)`);
 });
 
 createBot();
