@@ -1,0 +1,12 @@
+{
+  "name": "minecraft-server-bot",
+  "version": "1.0.0",
+  "description": "24/7 Minecraft server bot with auto-reconnect",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.23.0"
+  }
+}
