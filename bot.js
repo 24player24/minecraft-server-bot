@@ -5,8 +5,14 @@ const mineflayer = require('mineflayer');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const MC_HOST   = 'villain.falixsrv.me';
-const MC_PORT   = 48424;
+// All server addresses to try — rotates to the next on failure
+const SERVERS = [
+  { host: '157.90.205.61',      port: 48424 },
+  { host: 'villain.falixsrv.me', port: 20092 },
+  { host: '157.90.205.61',      port: 20092 },
+  { host: 'villain.falixsrv.me', port: 48424 },
+];
+
 const USERNAME  = 'StayAliveBot';
 const HTTP_PORT = parseInt(process.env.PORT || '3000', 10);
 
@@ -34,8 +40,12 @@ let pvpMode       = 'defend'; // 'off' | 'defend' | 'attack'
 let currentTarget = null;
 
 // Reconnect backoff tracking
-let failStreak    = 0;   // consecutive failed connection attempts
+let failStreak    = 0;    // consecutive failed connection attempts
 let serverOnline  = true; // optimistic — flipped by ECONNREFUSED/timeout
+let serverIndex   = 0;    // which server in SERVERS[] we're currently trying
+
+function currentServer() { return SERVERS[serverIndex]; }
+function nextServer()    { serverIndex = (serverIndex + 1) % SERVERS.length; }
 
 const startTime = Date.now();
 
@@ -245,11 +255,12 @@ function handleCommand(username, raw) {
 function createBot() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-  log(`Connecting to ${MC_HOST}:${MC_PORT} (attempt, streak: ${failStreak})...`);
+  const { host, port } = currentServer();
+  log(`Connecting to ${host}:${port} [server ${serverIndex + 1}/${SERVERS.length}] (streak: ${failStreak})...`);
 
   bot = mineflayer.createBot({
-    host:                 MC_HOST,
-    port:                 MC_PORT,
+    host,
+    port,
     username:             USERNAME,
     auth:                 'offline',
     keepAlive:            true,
@@ -311,32 +322,34 @@ function createBot() {
   bot.on('kicked', (reason) => {
     let msg = reason;
     try { const p = JSON.parse(reason); msg = p.text || p.translate || reason; } catch (_) {}
-    log(`⚠️  Kicked: ${msg}`);
-    // Kick = server was online and active — fast reconnect
+    log(`⚠️  Kicked from ${currentServer().host}:${currentServer().port}: ${msg}`);
     serverOnline = true;
     failStreak++;
+    nextServer(); // try next address on next reconnect
     cleanup();
     scheduleReconnect();
   });
 
   bot.on('error', (err) => {
     const code = err.code || '';
-    // ECONNREFUSED / ETIMEDOUT / ENOTFOUND = server is DOWN (FalixNodes stopped it)
+    const { host, port } = currentServer();
     if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') {
       serverOnline = false;
-      log(`🔴 Server offline (${code}) — backing off...`);
+      log(`🔴 ${host}:${port} offline (${code}) — trying next server...`);
     } else {
       serverOnline = true;
-      log(`❌ Error: ${err.message}`);
+      log(`❌ Error on ${host}:${port}: ${err.message}`);
     }
     failStreak++;
+    nextServer(); // rotate to next address
     cleanup();
     scheduleReconnect();
   });
 
   bot.on('end', (reason) => {
-    log(`🔌 Disconnected: ${reason || 'unknown'}`);
+    log(`🔌 Disconnected from ${currentServer().host}:${currentServer().port}: ${reason || 'unknown'}`);
     failStreak++;
+    nextServer(); // rotate to next address
     cleanup();
     scheduleReconnect();
   });
@@ -380,9 +393,12 @@ const server = http.createServer((req, res) => {
   const pad    = n => String(n).padStart(2, '0');
   const uptime = `${pad(Math.floor(upSec / 3600))}:${pad(Math.floor((upSec % 3600) / 60))}:${pad(upSec % 60)}`;
 
+  const { host, port } = currentServer();
   const body = JSON.stringify({
     status:    bot && bot.entity ? 'ONLINE' : (serverOnline ? 'RECONNECTING' : 'SERVER_DOWN'),
-    server:    `${MC_HOST}:${MC_PORT}`,
+    server:    `${host}:${port}`,
+    trying:    `${serverIndex + 1}/${SERVERS.length}`,
+    allServers: SERVERS.map(s => `${s.host}:${s.port}`),
     username:  USERNAME,
     pvpMode,
     health:    bot && bot.health != null ? bot.health.toFixed(1) : '?',
