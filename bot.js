@@ -5,12 +5,10 @@ const mineflayer = require('mineflayer');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-// All server addresses to try — rotates to the next on failure
+// Your FalixNodes server addresses — hostname only (raw IPs are shared and may hit wrong servers)
 const SERVERS = [
-  { host: '157.90.205.61',      port: 48424 },
-  { host: 'villain.falixsrv.me', port: 20092 },
-  { host: '157.90.205.61',      port: 20092 },
   { host: 'villain.falixsrv.me', port: 48424 },
+  { host: 'villain.falixsrv.me', port: 20092 },
 ];
 
 const USERNAME  = 'StayAliveBot';
