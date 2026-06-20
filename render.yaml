@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: minecraft-server-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node bot.js
+    healthCheckPath: /
+    autoDeploy: true
