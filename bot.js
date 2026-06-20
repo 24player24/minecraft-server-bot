@@ -1,6 +1,7 @@
 'use strict';
 
 const http       = require('http');
+const https      = require('https');
 const mineflayer = require('mineflayer');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -10,6 +11,10 @@ const SERVERS = [
   { host: 'villain.falixsrv.me', port: 48424 },
   { host: 'villain.falixsrv.me', port: 20092 },
 ];
+
+// FalixNodes auto-start URL — bot calls this when server is offline to wake it up
+const FALIX_START_URL = 'https://falixnodes.net/startserver?ip=villain.falixsrv.me';
+const SERVER_BOOT_WAIT_MS = 30_000; // wait 30s after waking for server to fully start
 
 const USERNAME  = 'StayAliveBot';
 const HTTP_PORT = parseInt(process.env.PORT || '3000', 10);
@@ -62,6 +67,24 @@ function getReconnectDelay() {
     return Math.min(RECONNECT_BASE_MS * Math.pow(2, Math.min(failStreak, 3)), 10_000);
   }
   return Math.min(RECONNECT_BASE_MS * Math.pow(2, Math.min(failStreak, 5)), RECONNECT_MAX_MS);
+}
+
+// ─── FalixNodes Wake-Up ───────────────────────────────────────────────────────
+
+let waking = false; // prevent hammering the wake URL
+
+function wakeServer() {
+  if (waking) return;
+  waking = true;
+  log(`🚀 Sending wake-up request to FalixNodes...`);
+  https.get(FALIX_START_URL, (res) => {
+    log(`🚀 Wake-up response: HTTP ${res.statusCode} — waiting ${SERVER_BOOT_WAIT_MS / 1000}s for server to boot...`);
+    res.resume(); // drain response body
+  }).on('error', (err) => {
+    log(`🚀 Wake-up request failed: ${err.message}`);
+  }).on('close', () => {
+    setTimeout(() => { waking = false; }, SERVER_BOOT_WAIT_MS);
+  });
 }
 
 // ─── Anti-AFK ─────────────────────────────────────────────────────────────────
@@ -333,7 +356,8 @@ function createBot() {
     const { host, port } = currentServer();
     if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') {
       serverOnline = false;
-      log(`🔴 ${host}:${port} offline (${code}) — trying next server...`);
+      log(`🔴 ${host}:${port} offline (${code})`);
+      wakeServer(); // tell FalixNodes to start the server
     } else {
       serverOnline = true;
       log(`❌ Error on ${host}:${port}: ${err.message}`);
