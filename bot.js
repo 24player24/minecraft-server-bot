@@ -1,31 +1,41 @@
-const http = require('http');
+'use strict';
+
+const http      = require('http');
 const mineflayer = require('mineflayer');
-const { pathfinder, Movements } = require('mineflayer-pathfinder');
-const pvp = require('mineflayer-pvp').plugin;
 
-const HOST = 'villain.falixsrv.me';
-const MC_PORT = 48424;
-const USERNAME = 'StayAliveBot';
-const HTTP_PORT = process.env.PORT || 3000; // Render injects PORT
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-let bot = null;
+const MC_HOST   = 'villain.falixsrv.me';
+const MC_PORT   = 48424;
+const USERNAME  = 'StayAliveBot';
+const HTTP_PORT = parseInt(process.env.PORT || '3000', 10);
+
+const RECONNECT_MS    = 5_000;
+const ANTI_AFK_MS     = 30_000;
+const PVP_SCAN_MS     = 2_000;
+const COMBAT_TICK_MS  = 250;   // how often the combat loop runs
+const STATUS_MS       = 60_000;
+const PVP_RANGE       = 16;    // blocks — scan radius
+const ATTACK_RANGE    = 3.5;   // blocks — melee reach
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+let bot           = null;
 let reconnectTimer = null;
-let antiAfkTimer = null;
-let pvpScanTimer = null;
-let statusTimer = null; // FIX: module-level so it can be cleared on cleanup
+let antiAfkTimer  = null;
+let pvpScanTimer  = null;
+let combatTimer   = null;
+let statusTimer   = null;
 
-const RECONNECT_DELAY_MS = 5000;
-const ANTI_AFK_INTERVAL_MS = 30000;
-const PVP_SCAN_INTERVAL_MS = 2000;
-const PVP_RANGE = 16;
-
-let pvpMode = 'defend'; // 'off' | 'defend' | 'attack'
+let pvpMode      = 'defend'; // 'off' | 'defend' | 'attack'
 let currentTarget = null;
+
+const startTime = Date.now();
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
 function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
+  process.stdout.write(`[${new Date().toISOString()}] ${msg}\n`);
 }
 
 // ─── Anti-AFK ─────────────────────────────────────────────────────────────────
@@ -34,31 +44,135 @@ function startAntiAfk() {
   stopAntiAfk();
   antiAfkTimer = setInterval(() => {
     if (!bot || !bot.entity || currentTarget) return;
-    const action = Math.floor(Math.random() * 5);
     try {
-      if (action === 0) {
+      const r = Math.random();
+      if (r < 0.2) {
         bot.setControlState('jump', true);
-        setTimeout(() => { if (bot) bot.setControlState('jump', false); }, 500);
-      } else if (action === 1) {
-        bot.setControlState('sneak', true);
-        setTimeout(() => { if (bot) bot.setControlState('sneak', false); }, 1000);
-      } else if (action === 2) {
+        setTimeout(() => bot && bot.setControlState('jump', false), 400);
+      } else if (r < 0.4) {
         bot.setControlState('forward', true);
-        setTimeout(() => { if (bot) bot.setControlState('forward', false); }, 800);
-      } else if (action === 3) {
+        setTimeout(() => bot && bot.setControlState('forward', false), 700);
+      } else if (r < 0.6) {
         bot.setControlState('back', true);
-        setTimeout(() => { if (bot) bot.setControlState('back', false); }, 800);
+        setTimeout(() => bot && bot.setControlState('back', false), 700);
+      } else if (r < 0.8) {
+        bot.setControlState('sneak', true);
+        setTimeout(() => bot && bot.setControlState('sneak', false), 900);
       } else {
-        const yaw = (Math.random() * Math.PI * 2) - Math.PI;
-        const pitch = (Math.random() * Math.PI / 2) - Math.PI / 4;
-        bot.look(yaw, pitch, false);
+        bot.look(
+          (Math.random() * Math.PI * 2) - Math.PI,
+          (Math.random() - 0.5) * (Math.PI / 2),
+          false
+        );
       }
     } catch (_) {}
-  }, ANTI_AFK_INTERVAL_MS);
+  }, ANTI_AFK_MS);
 }
 
 function stopAntiAfk() {
   if (antiAfkTimer) { clearInterval(antiAfkTimer); antiAfkTimer = null; }
+}
+
+// ─── Lightweight PvP (no pathfinder, no mineflayer-pvp) ───────────────────────
+
+function getNearestPlayer() {
+  if (!bot || !bot.entity) return null;
+  let nearest = null;
+  let nearestDist = PVP_RANGE;
+  // iterate directly — avoid Object.values() allocation
+  for (const id in bot.entities) {
+    const e = bot.entities[id];
+    if (e.type !== 'player' || e.username === bot.username) continue;
+    const d = bot.entity.position.distanceTo(e.position);
+    if (d < nearestDist) { nearest = e; nearestDist = d; }
+  }
+  return nearest;
+}
+
+function startCombat(entity) {
+  if (!bot || !entity) return;
+  stopCombat(true);
+  currentTarget = entity;
+  log(`⚔️  Attacking ${entity.username || entity.type}`);
+
+  combatTimer = setInterval(() => {
+    if (!bot || !bot.entity) { stopCombat(true); return; }
+
+    // Re-fetch entity from live registry
+    const target = currentTarget && bot.entities[currentTarget.id];
+    if (!target) {
+      log('Target gone.');
+      stopCombat(true);
+      return;
+    }
+
+    const dist = bot.entity.position.distanceTo(target.position);
+    if (dist > PVP_RANGE + 4) {
+      log(`Target ${target.username || target.type} out of range.`);
+      stopCombat(true);
+      return;
+    }
+
+    try {
+      // Always look at target
+      bot.lookAt(target.position.offset(0, target.height * 0.9, 0), true);
+
+      if (dist > ATTACK_RANGE) {
+        // Chase
+        bot.setControlState('sprint', true);
+        bot.setControlState('forward', true);
+        // Jump to close distance faster
+        if (bot.entity.onGround && Math.random() < 0.3) {
+          bot.setControlState('jump', true);
+          setTimeout(() => bot && bot.setControlState('jump', false), 150);
+        }
+      } else {
+        // In melee range
+        bot.setControlState('forward', false);
+        bot.setControlState('sprint', false);
+        // Critical hit: attack while falling
+        if (bot.entity.onGround) {
+          bot.setControlState('jump', true);
+          setTimeout(() => {
+            if (!bot) return;
+            bot.setControlState('jump', false);
+            try { bot.attack(target); } catch (_) {}
+          }, 100);
+        } else {
+          bot.attack(target);
+        }
+      }
+    } catch (_) {}
+  }, COMBAT_TICK_MS);
+}
+
+function stopCombat(silent = false) {
+  if (combatTimer) { clearInterval(combatTimer); combatTimer = null; }
+  currentTarget = null;
+  if (bot) {
+    try {
+      bot.setControlState('forward', false);
+      bot.setControlState('sprint', false);
+      bot.setControlState('jump', false);
+    } catch (_) {}
+  }
+  if (!silent) log('⛔ Stopped attacking.');
+}
+
+function startPvpScan() {
+  stopPvpScan();
+  pvpScanTimer = setInterval(() => {
+    if (!bot || !bot.entity || pvpMode === 'off') return;
+    if (currentTarget) return; // combat loop handles the rest
+    if (pvpMode === 'attack') {
+      const nearest = getNearestPlayer();
+      if (nearest) startCombat(nearest);
+    }
+  }, PVP_SCAN_MS);
+}
+
+function stopPvpScan() {
+  if (pvpScanTimer) { clearInterval(pvpScanTimer); pvpScanTimer = null; }
 }
 
 // ─── Status Logger ────────────────────────────────────────────────────────────
@@ -68,136 +182,72 @@ function startStatusLogger() {
   statusTimer = setInterval(() => {
     if (bot && bot.entity) {
       log(
-        `💓 Health: ${bot.health != null ? bot.health.toFixed(1) : '?'}/20 | ` +
+        `💓 HP: ${bot.health != null ? bot.health.toFixed(1) : '?'}/20 | ` +
         `Food: ${bot.food ?? '?'} | ` +
         `PvP: ${pvpMode.toUpperCase()} | ` +
         `Target: ${currentTarget ? (currentTarget.username || currentTarget.type) : 'none'}`
       );
     }
-  }, 60000);
+  }, STATUS_MS);
 }
 
 function stopStatusLogger() {
   if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
 }
 
-// ─── PvP ──────────────────────────────────────────────────────────────────────
-
-function getNearestPlayer() {
-  if (!bot || !bot.entity) return null;
-  let nearest = null;
-  let nearestDist = PVP_RANGE;
-  for (const entity of Object.values(bot.entities)) {
-    if (entity.type !== 'player') continue;
-    if (entity.username === bot.username) continue;
-    const dist = bot.entity.position.distanceTo(entity.position);
-    if (dist < nearestDist) { nearest = entity; nearestDist = dist; }
-  }
-  return nearest;
-}
-
-function attackTarget(entity) {
-  if (!bot || !entity) return;
-  currentTarget = entity;
-  log(`⚔️  Attacking ${entity.username || entity.name || entity.type}`);
-  try {
-    bot.pvp.attack(entity);
-  } catch (err) {
-    log(`PvP attack error: ${err.message}`);
-    currentTarget = null;
-  }
-}
-
-function stopAttacking(silent = false) {
-  if (!bot) { currentTarget = null; return; }
-  currentTarget = null;
-  try { bot.pvp.stop(); } catch (_) {}
-  try { bot.pathfinder.stop(); } catch (_) {}
-  if (!silent) log('⛔ Stopped attacking.');
-}
-
-function startPvpScan() {
-  stopPvpScan();
-  pvpScanTimer = setInterval(() => {
-    if (!bot || !bot.entity) return;
-
-    if (pvpMode === 'off') {
-      if (currentTarget) stopAttacking(true);
-      return;
-    }
-
-    if (currentTarget) {
-      // FIX: entity.id check — reference equality can fail across reconnects
-      const stillValid =
-        currentTarget.id != null &&
-        bot.entities[currentTarget.id] &&
-        bot.entity.position.distanceTo(currentTarget.position) < PVP_RANGE + 8;
-      if (!stillValid) {
-        log(`Target ${currentTarget.username || currentTarget.type} lost.`);
-        stopAttacking(true);
-      }
-      return;
-    }
-
-    if (pvpMode === 'attack') {
-      const nearest = getNearestPlayer();
-      if (nearest) attackTarget(nearest);
-    }
-  }, PVP_SCAN_INTERVAL_MS);
-}
-
-function stopPvpScan() {
-  if (pvpScanTimer) { clearInterval(pvpScanTimer); pvpScanTimer = null; }
-}
-
 // ─── Chat Commands ────────────────────────────────────────────────────────────
 
-function handleCommand(username, message) {
-  const msg = message.trim().toLowerCase();
+function handleCommand(username, raw) {
+  if (!bot) return;
+  const msg = raw.trim().toLowerCase();
 
   if (msg === '!pvp attack') {
     pvpMode = 'attack';
-    log(`PvP mode → ATTACK (by ${username})`);
-    bot.chat('⚔️ PvP: ATTACK — hunting all nearby players.');
+    log(`PvP → ATTACK (by ${username})`);
+    bot.chat('⚔️ PvP: ATTACK — hunting nearby players.');
 
   } else if (msg === '!pvp defend') {
     pvpMode = 'defend';
-    stopAttacking(true);
-    log(`PvP mode → DEFEND (by ${username})`);
-    bot.chat('🛡️ PvP: DEFEND — fighting back only if attacked.');
+    stopCombat();
+    log(`PvP → DEFEND (by ${username})`);
+    bot.chat('🛡️ PvP: DEFEND — retaliating only.');
 
   } else if (msg === '!pvp off') {
     pvpMode = 'off';
-    stopAttacking(true);
-    log(`PvP mode → OFF (by ${username})`);
-    bot.chat('❌ PvP: OFF — not fighting anyone.');
+    stopCombat();
+    log(`PvP → OFF (by ${username})`);
+    bot.chat('❌ PvP: OFF.');
 
   } else if (msg.startsWith('!kill ')) {
-    const targetName = message.trim().slice(6).trim();
-    const target = Object.values(bot.entities).find(
-      e => e.type === 'player' && e.username &&
-           e.username.toLowerCase() === targetName.toLowerCase()
-    );
-    if (target) {
-      attackTarget(target);
-      bot.chat(`⚔️ Targeting ${target.username}!`);
+    const name = raw.trim().slice(6).trim().toLowerCase();
+    let found = null;
+    for (const id in bot.entities) {
+      const e = bot.entities[id];
+      if (e.type === 'player' && e.username && e.username.toLowerCase() === name) {
+        found = e; break;
+      }
+    }
+    if (found) {
+      startCombat(found);
+      bot.chat(`⚔️ Targeting ${found.username}!`);
     } else {
-      bot.chat(`❌ Player "${targetName}" not found nearby.`);
+      bot.chat(`❌ "${raw.trim().slice(6).trim()}" not found nearby.`);
     }
 
   } else if (msg === '!stop') {
-    stopAttacking();
+    stopCombat();
+    bot.chat('⛔ Stopped.');
 
   } else if (msg === '!status') {
     bot.chat(
-      `📊 HP: ${bot.health != null ? bot.health.toFixed(1) : '?'}/20 | ` +
-      `Food: ${bot.food ?? '?'} | ` +
-      `PvP: ${pvpMode.toUpperCase()} | ` +
-      `Target: ${currentTarget ? (currentTarget.username || currentTarget.type) : 'none'}`
+      `📊 HP:${bot.health != null ? bot.health.toFixed(1) : '?'} ` +
+      `Food:${bot.food ?? '?'} ` +
+      `PvP:${pvpMode.toUpperCase()} ` +
+      `Target:${currentTarget ? (currentTarget.username || currentTarget.type) : 'none'}`
     );
 
   } else if (msg === '!help') {
-    bot.chat('Commands: !pvp attack | !pvp defend | !pvp off | !kill <name> | !stop | !status');
+    bot.chat('!pvp attack/defend/off | !kill <name> | !stop | !status');
   }
 }
 
@@ -206,33 +256,20 @@ function handleCommand(username, message) {
 function createBot() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-  log(`Connecting to ${HOST}:${MC_PORT} as ${USERNAME}...`);
+  log(`Connecting to ${MC_HOST}:${MC_PORT} as ${USERNAME}...`);
 
   bot = mineflayer.createBot({
-    host: HOST,
-    port: MC_PORT,
-    username: USERNAME,
-    // FIX: removed VERSION=false — mineflayer rejects it; omit to auto-detect
-    auth: 'offline',
-    keepAlive: true,
-    checkTimeoutInterval: 30000,
+    host:                  MC_HOST,
+    port:                  MC_PORT,
+    username:              USERNAME,
+    auth:                  'offline',
+    keepAlive:             true,
+    checkTimeoutInterval:  30_000,
+    skipValidation:        true,   // skip packet validation — saves CPU + RAM
   });
 
-  bot.loadPlugin(pathfinder);
-  bot.loadPlugin(pvp);
-
   bot.once('spawn', () => {
-    log('✅ Spawned. Anti-AFK + PvP active.');
-    log(`Mode: ${pvpMode.toUpperCase()} | Range: ${PVP_RANGE} blocks | !help for commands`);
-
-    try {
-      const movements = new Movements(bot);
-      movements.allowSprinting = true;
-      bot.pathfinder.setMovements(movements);
-    } catch (err) {
-      log(`Pathfinder setup error: ${err.message}`);
-    }
-
+    log(`✅ Spawned | PvP: ${pvpMode.toUpperCase()} | Range: ${PVP_RANGE}m | !help`);
     startAntiAfk();
     startPvpScan();
     startStatusLogger();
@@ -240,32 +277,32 @@ function createBot() {
 
   bot.on('respawn', () => {
     log('🔄 Respawned.');
-    currentTarget = null;
-    try { bot.pvp.stop(); } catch (_) {}
+    stopCombat(true);
     startAntiAfk();
     startPvpScan();
   });
 
-  // FIX: compare entity.id instead of reference to avoid false negatives
+  // Self-defense: hit back when hurt
   bot.on('entityHurt', (entity) => {
     if (!bot || !bot.entity) return;
     if (entity.id !== bot.entity.id) return;
-    if (pvpMode === 'off') return;
-    if (currentTarget) return; // already fighting
+    if (pvpMode === 'off' || currentTarget) return;
     const attacker = getNearestPlayer();
     if (attacker) {
-      log(`🛡️ Hit! Defending against ${attacker.username || attacker.type}`);
-      attackTarget(attacker);
+      log(`🛡️ Hit! Counter-attacking ${attacker.username || attacker.type}`);
+      startCombat(attacker);
     }
   });
 
+  // Auto-attack on player entering range in attack mode
   bot.on('entitySpawn', (entity) => {
     if (!bot || !bot.entity) return;
     if (entity.type !== 'player' || entity.username === bot.username) return;
+    if (pvpMode !== 'attack' || currentTarget) return;
     const dist = bot.entity.position.distanceTo(entity.position);
     if (dist <= PVP_RANGE) {
-      log(`👀 ${entity.username} appeared nearby (${dist.toFixed(1)} blocks)`);
-      if (pvpMode === 'attack' && !currentTarget) attackTarget(entity);
+      log(`👀 ${entity.username} in range (${dist.toFixed(1)}m)`);
+      startCombat(entity);
     }
   });
 
@@ -277,7 +314,10 @@ function createBot() {
 
   bot.on('kicked', (reason) => {
     let msg = reason;
-    try { msg = JSON.parse(reason).text || reason; } catch (_) {}
+    try {
+      const parsed = JSON.parse(reason);
+      msg = parsed.text || parsed.translate || reason;
+    } catch (_) {}
     log(`Kicked: ${msg}`);
     cleanup();
     scheduleReconnect();
@@ -300,72 +340,51 @@ function createBot() {
 
 function cleanup() {
   stopAntiAfk();
+  stopCombat(true);
   stopPvpScan();
   stopStatusLogger();
-  currentTarget = null;
   if (bot) {
-    // FIX: stop pvp/pathfinder BEFORE removing listeners
-    try { bot.pvp.stop(); } catch (_) {}
-    try { bot.pathfinder.stop(); } catch (_) {}
     try { bot.removeAllListeners(); } catch (_) {}
     bot = null;
   }
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return; // already scheduled
-  log(`Reconnecting in ${RECONNECT_DELAY_MS / 1000}s...`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    createBot();
-  }, RECONNECT_DELAY_MS);
+  if (reconnectTimer) return;
+  log(`Reconnecting in ${RECONNECT_MS / 1000}s...`);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; createBot(); }, RECONNECT_MS);
 }
 
-// FIX: only reconnect on uncaughtException (true crashes), not all rejections
 process.on('uncaughtException', (err) => {
   log(`Uncaught exception: ${err.message}`);
   cleanup();
   scheduleReconnect();
 });
 
-// FIX: log unhandled rejections but don't blindly reconnect — they may be unrelated
 process.on('unhandledRejection', (reason) => {
   log(`Unhandled rejection: ${reason}`);
 });
 
-// ─── HTTP Status Server ───────────────────────────────────────────────────────
-// Required so Render keeps the process alive and UptimeRobot gets a 200 OK.
-
-const startTime = Date.now();
+// ─── HTTP Status Server (keeps Render alive, gives UptimeRobot a 200 OK) ──────
 
 http.createServer((req, res) => {
-  const uptime = Math.floor((Date.now() - startTime) / 1000);
-  const hh = String(Math.floor(uptime / 3600)).padStart(2, '0');
-  const mm = String(Math.floor((uptime % 3600) / 60)).padStart(2, '0');
-  const ss = String(uptime % 60).padStart(2, '0');
-
-  const connected = bot && bot.entity ? 'ONLINE' : 'RECONNECTING';
-  const health    = bot && bot.health  != null ? bot.health.toFixed(1) : '?';
-  const food      = bot && bot.food    != null ? String(bot.food)      : '?';
-  const target    = currentTarget
-    ? (currentTarget.username || currentTarget.type)
-    : 'none';
-
-  const body = JSON.stringify({
-    status:   connected,
-    server:   `${HOST}:${MC_PORT}`,
-    username: USERNAME,
-    pvpMode,
-    health,
-    food,
-    target,
-    uptime:   `${hh}:${mm}:${ss}`,
-  }, null, 2);
+  const upSec = Math.floor((Date.now() - startTime) / 1000);
+  const pad   = n => String(n).padStart(2, '0');
+  const uptime = `${pad(Math.floor(upSec / 3600))}:${pad(Math.floor((upSec % 3600) / 60))}:${pad(upSec % 60)}`;
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(body);
-}).listen(HTTP_PORT, () => {
-  log(`🌐 Status server listening on port ${HTTP_PORT} (for Render + UptimeRobot)`);
-});
+  res.end(JSON.stringify({
+    status:   bot && bot.entity ? 'ONLINE' : 'RECONNECTING',
+    server:   `${MC_HOST}:${MC_PORT}`,
+    username: USERNAME,
+    pvpMode,
+    health:   bot && bot.health  != null ? bot.health.toFixed(1) : '?',
+    food:     bot && bot.food    != null ? String(bot.food)       : '?',
+    target:   currentTarget ? (currentTarget.username || currentTarget.type) : 'none',
+    uptime,
+  }, null, 2));
+}).listen(HTTP_PORT, () => log(`🌐 Status server on :${HTTP_PORT}`));
+
+// ─── Start ────────────────────────────────────────────────────────────────────
 
 createBot();
