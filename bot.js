@@ -373,26 +373,37 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ─── HTTP Status Server ───────────────────────────────────────────────────────
+// Handles ALL paths so Render health checks (/healthz, /, etc.) all return 200.
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   const upSec  = Math.floor((Date.now() - startTime) / 1000);
   const pad    = n => String(n).padStart(2, '0');
   const uptime = `${pad(Math.floor(upSec / 3600))}:${pad(Math.floor((upSec % 3600) / 60))}:${pad(upSec % 60)}`;
 
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    status:       bot && bot.entity ? 'ONLINE' : (serverOnline ? 'RECONNECTING' : 'SERVER_DOWN'),
-    server:       `${MC_HOST}:${MC_PORT}`,
-    username:     USERNAME,
+  const body = JSON.stringify({
+    status:    bot && bot.entity ? 'ONLINE' : (serverOnline ? 'RECONNECTING' : 'SERVER_DOWN'),
+    server:    `${MC_HOST}:${MC_PORT}`,
+    username:  USERNAME,
     pvpMode,
-    health:       bot && bot.health != null ? bot.health.toFixed(1) : '?',
-    food:         bot && bot.food   != null ? String(bot.food)      : '?',
-    target:       currentTarget ? (currentTarget.username || currentTarget.type) : 'none',
+    health:    bot && bot.health != null ? bot.health.toFixed(1) : '?',
+    food:      bot && bot.food   != null ? String(bot.food)      : '?',
+    target:    currentTarget ? (currentTarget.username || currentTarget.type) : 'none',
     failStreak,
-    nextRetry:    reconnectTimer ? `${getReconnectDelay() / 1000}s` : 'connected',
+    nextRetry: reconnectTimer ? `${getReconnectDelay() / 1000}s` : 'connected',
     uptime,
-  }, null, 2));
-}).listen(HTTP_PORT, () => log(`🌐 Status server on :${HTTP_PORT}`));
+  }, null, 2);
+
+  res.writeHead(200, {
+    'Content-Type':  'application/json',
+    'Cache-Control': 'no-cache',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+});
+
+server.on('error', (err) => log(`🌐 HTTP server error: ${err.message}`));
+
+server.listen(HTTP_PORT, '0.0.0.0', () => log(`🌐 Status server on 0.0.0.0:${HTTP_PORT}`));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
