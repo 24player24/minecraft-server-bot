@@ -6,27 +6,20 @@ const mineflayer = require('mineflayer');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-// Your FalixNodes server addresses — hostname only (raw IPs are shared and may hit wrong servers)
 const SERVERS = [
   { host: 'villain.falixsrv.me', port: 48424 },
   { host: 'villain.falixsrv.me', port: 20092 },
 ];
 
-// FalixNodes auto-start URL — bot calls this when server is offline to wake it up
-const FALIX_START_URL = 'https://falixnodes.net/startserver?ip=villain.falixsrv.me';
-const SERVER_BOOT_WAIT_MS = 30_000; // wait 30s after waking for server to fully start
+const FALIX_START_URL   = 'https://falixnodes.net/startserver?ip=villain.falixsrv.me';
+const SERVER_BOOT_WAIT_MS = 30_000;
 
 const USERNAME  = 'StayAliveBot';
 const HTTP_PORT = parseInt(process.env.PORT || '3000', 10);
 
-const ANTI_AFK_MS    = 30_000;
-const PVP_SCAN_MS    = 2_000;
-const COMBAT_TICK_MS = 250;
-const STATUS_MS      = 60_000;
-const PVP_RANGE      = 16;
-const ATTACK_RANGE   = 3.5;
+const ANTI_AFK_MS = 30_000;
+const STATUS_MS   = 60_000;
 
-// Reconnect backoff: 2s, 4s, 8s, 16s, 32s, 60s (cap)
 const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS  = 60_000;
 
@@ -35,17 +28,11 @@ const RECONNECT_MAX_MS  = 60_000;
 let bot            = null;
 let reconnectTimer = null;
 let antiAfkTimer   = null;
-let pvpScanTimer   = null;
-let combatTimer    = null;
 let statusTimer    = null;
 
-let pvpMode       = 'defend'; // 'off' | 'defend' | 'attack'
-let currentTarget = null;
-
-// Reconnect backoff tracking
-let failStreak    = 0;    // consecutive failed connection attempts
-let serverOnline  = true; // optimistic — flipped by ECONNREFUSED/timeout
-let serverIndex   = 0;    // which server in SERVERS[] we're currently trying
+let failStreak   = 0;
+let serverOnline = true;
+let serverIndex  = 0;
 
 function currentServer() { return SERVERS[serverIndex]; }
 function nextServer()    { serverIndex = (serverIndex + 1) % SERVERS.length; }
@@ -61,8 +48,6 @@ function log(msg) {
 // ─── Backoff ──────────────────────────────────────────────────────────────────
 
 function getReconnectDelay() {
-  // Fast retry when server is known online (quick kick recovery)
-  // Slow retry when server appears offline (FalixNodes auto-stop)
   if (serverOnline) {
     return Math.min(RECONNECT_BASE_MS * Math.pow(2, Math.min(failStreak, 3)), 10_000);
   }
@@ -71,7 +56,7 @@ function getReconnectDelay() {
 
 // ─── FalixNodes Wake-Up ───────────────────────────────────────────────────────
 
-let waking = false; // prevent hammering the wake URL
+let waking = false;
 
 function wakeServer() {
   if (waking) return;
@@ -79,7 +64,7 @@ function wakeServer() {
   log(`🚀 Sending wake-up request to FalixNodes...`);
   https.get(FALIX_START_URL, (res) => {
     log(`🚀 Wake-up response: HTTP ${res.statusCode} — waiting ${SERVER_BOOT_WAIT_MS / 1000}s for server to boot...`);
-    res.resume(); // drain response body
+    res.resume();
   }).on('error', (err) => {
     log(`🚀 Wake-up request failed: ${err.message}`);
   }).on('close', () => {
@@ -89,8 +74,6 @@ function wakeServer() {
 
 // ─── FalixNodes Verification Link ─────────────────────────────────────────────
 
-// FalixNodes sends a verification URL in chat to confirm a real player is present.
-// The bot extracts it and GETs it automatically to keep the server alive.
 function verifyFalix(url) {
   log(`🔐 Verifying FalixNodes link: ${url}`);
   const lib = url.startsWith('https') ? https : http;
@@ -103,11 +86,9 @@ function verifyFalix(url) {
 }
 
 function checkMessageForVerification(text) {
-  // Match any http/https URL in the message
   const match = text.match(/https?:\/\/[^\s"'<>]+/i);
   if (!match) return;
   const url = match[0];
-  // Only handle FalixNodes verification links
   if (url.includes('falixnodes.net') || url.includes('falix.host') || url.includes('falix.gg')) {
     verifyFalix(url);
   }
@@ -118,7 +99,7 @@ function checkMessageForVerification(text) {
 function startAntiAfk() {
   stopAntiAfk();
   antiAfkTimer = setInterval(() => {
-    if (!bot || !bot.entity || currentTarget) return;
+    if (!bot || !bot.entity) return;
     try {
       const r = Math.random();
       if (r < 0.2) {
@@ -157,8 +138,6 @@ function startStatusLogger() {
       log(
         `💓 HP:${bot.health != null ? bot.health.toFixed(1) : '?'}/20 | ` +
         `Food:${bot.food ?? '?'} | ` +
-        `PvP:${pvpMode.toUpperCase()} | ` +
-        `Target:${currentTarget ? (currentTarget.username || currentTarget.type) : 'none'} | ` +
         `Fails:${failStreak}`
       );
     }
@@ -169,131 +148,21 @@ function stopStatusLogger() {
   if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
 }
 
-// ─── Lightweight PvP ──────────────────────────────────────────────────────────
-
-function getNearestPlayer() {
-  if (!bot || !bot.entity) return null;
-  let nearest = null;
-  let nearestDist = PVP_RANGE;
-  for (const id in bot.entities) {
-    const e = bot.entities[id];
-    if (e.type !== 'player' || e.username === bot.username) continue;
-    const d = bot.entity.position.distanceTo(e.position);
-    if (d < nearestDist) { nearest = e; nearestDist = d; }
-  }
-  return nearest;
-}
-
-function startCombat(entity) {
-  if (!bot || !entity) return;
-  stopCombat(true);
-  currentTarget = entity;
-  log(`⚔️  Attacking ${entity.username || entity.type}`);
-
-  combatTimer = setInterval(() => {
-    if (!bot || !bot.entity) { stopCombat(true); return; }
-    const target = currentTarget && bot.entities[currentTarget.id];
-    if (!target) { log('Target gone.'); stopCombat(true); return; }
-
-    const dist = bot.entity.position.distanceTo(target.position);
-    if (dist > PVP_RANGE + 4) { log(`Target out of range.`); stopCombat(true); return; }
-
-    try {
-      bot.lookAt(target.position.offset(0, target.height * 0.9, 0), true);
-      if (dist > ATTACK_RANGE) {
-        bot.setControlState('sprint', true);
-        bot.setControlState('forward', true);
-        if (bot.entity.onGround && Math.random() < 0.3) {
-          bot.setControlState('jump', true);
-          setTimeout(() => bot && bot.setControlState('jump', false), 150);
-        }
-      } else {
-        bot.setControlState('forward', false);
-        bot.setControlState('sprint', false);
-        if (bot.entity.onGround) {
-          bot.setControlState('jump', true);
-          setTimeout(() => {
-            if (!bot) return;
-            bot.setControlState('jump', false);
-            try { bot.attack(target); } catch (_) {}
-          }, 100);
-        } else {
-          bot.attack(target);
-        }
-      }
-    } catch (_) {}
-  }, COMBAT_TICK_MS);
-}
-
-function stopCombat(silent = false) {
-  if (combatTimer) { clearInterval(combatTimer); combatTimer = null; }
-  currentTarget = null;
-  if (bot) {
-    try {
-      bot.setControlState('forward', false);
-      bot.setControlState('sprint', false);
-      bot.setControlState('jump', false);
-    } catch (_) {}
-  }
-  if (!silent) log('⛔ Stopped attacking.');
-}
-
-function startPvpScan() {
-  stopPvpScan();
-  pvpScanTimer = setInterval(() => {
-    if (!bot || !bot.entity || pvpMode === 'off' || currentTarget) return;
-    if (pvpMode === 'attack') {
-      const nearest = getNearestPlayer();
-      if (nearest) startCombat(nearest);
-    }
-  }, PVP_SCAN_MS);
-}
-
-function stopPvpScan() {
-  if (pvpScanTimer) { clearInterval(pvpScanTimer); pvpScanTimer = null; }
-}
-
 // ─── Chat Commands ────────────────────────────────────────────────────────────
 
 function handleCommand(username, raw) {
   if (!bot) return;
   const msg = raw.trim().toLowerCase();
 
-  if (msg === '!pvp attack') {
-    pvpMode = 'attack';
-    bot.chat('⚔️ PvP: ATTACK');
-
-  } else if (msg === '!pvp defend') {
-    pvpMode = 'defend'; stopCombat();
-    bot.chat('🛡️ PvP: DEFEND');
-
-  } else if (msg === '!pvp off') {
-    pvpMode = 'off'; stopCombat();
-    bot.chat('❌ PvP: OFF');
-
-  } else if (msg.startsWith('!kill ')) {
-    const name = raw.trim().slice(6).trim().toLowerCase();
-    let found = null;
-    for (const id in bot.entities) {
-      const e = bot.entities[id];
-      if (e.type === 'player' && e.username && e.username.toLowerCase() === name) { found = e; break; }
-    }
-    found ? (startCombat(found), bot.chat(`⚔️ Targeting ${found.username}!`))
-           : bot.chat(`❌ "${raw.trim().slice(6).trim()}" not found.`);
-
-  } else if (msg === '!stop') {
-    stopCombat();
-
-  } else if (msg === '!status') {
+  if (msg === '!status') {
     const delay = getReconnectDelay();
     bot.chat(
       `📊 HP:${bot.health != null ? bot.health.toFixed(1) : '?'} ` +
-      `Food:${bot.food ?? '?'} PvP:${pvpMode.toUpperCase()} ` +
+      `Food:${bot.food ?? '?'} ` +
       `Fails:${failStreak} NextRetry:${delay / 1000}s`
     );
-
   } else if (msg === '!help') {
-    bot.chat('!pvp attack/defend/off | !kill <name> | !stop | !status');
+    bot.chat('Commands: !status');
   }
 }
 
@@ -315,57 +184,25 @@ function createBot() {
     skipValidation:       true,
   });
 
-  // ── Successful connection ───────────────────────────────────────────────────
-
   bot.once('spawn', () => {
-    failStreak   = 0;     // reset on successful spawn
+    failStreak   = 0;
     serverOnline = true;
-    log(`✅ Spawned! PvP:${pvpMode.toUpperCase()} Range:${PVP_RANGE}m | !help`);
+    log(`✅ Spawned! Anti-AFK active. Type !status in chat for info.`);
     startAntiAfk();
-    startPvpScan();
     startStatusLogger();
   });
 
   bot.on('respawn', () => {
     log('🔄 Respawned.');
-    stopCombat(true);
     startAntiAfk();
-    startPvpScan();
   });
-
-  // ── PvP events ─────────────────────────────────────────────────────────────
-
-  bot.on('entityHurt', (entity) => {
-    if (!bot || !bot.entity) return;
-    if (entity.id !== bot.entity.id || pvpMode === 'off' || currentTarget) return;
-    const attacker = getNearestPlayer();
-    if (attacker) {
-      log(`🛡️ Hit! Counter-attacking ${attacker.username || attacker.type}`);
-      startCombat(attacker);
-    }
-  });
-
-  bot.on('entitySpawn', (entity) => {
-    if (!bot || !bot.entity) return;
-    if (entity.type !== 'player' || entity.username === bot.username) return;
-    if (pvpMode !== 'attack' || currentTarget) return;
-    const dist = bot.entity.position.distanceTo(entity.position);
-    if (dist <= PVP_RANGE) {
-      log(`👀 ${entity.username} in range (${dist.toFixed(1)}m) — attacking`);
-      startCombat(entity);
-    }
-  });
-
-  // ── Chat ────────────────────────────────────────────────────────────────────
 
   bot.on('chat', (username, message) => {
     if (username === bot.username) return;
     log(`<${username}> ${message}`);
     handleCommand(username, message);
-    checkMessageForVerification(message); // catch verification links sent as player chat
+    checkMessageForVerification(message);
   });
-
-  // ── System / server messages (FalixNodes verification links come through here) ─
 
   bot.on('message', (jsonMsg) => {
     const text = jsonMsg.toString();
@@ -374,15 +211,13 @@ function createBot() {
     checkMessageForVerification(text);
   });
 
-  // ── Disconnection events ────────────────────────────────────────────────────
-
   bot.on('kicked', (reason) => {
     let msg = reason;
     try { const p = JSON.parse(reason); msg = p.text || p.translate || reason; } catch (_) {}
     log(`⚠️  Kicked from ${currentServer().host}:${currentServer().port}: ${msg}`);
     serverOnline = true;
     failStreak++;
-    nextServer(); // try next address on next reconnect
+    nextServer();
     cleanup();
     scheduleReconnect();
   });
@@ -393,13 +228,13 @@ function createBot() {
     if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') {
       serverOnline = false;
       log(`🔴 ${host}:${port} offline (${code})`);
-      wakeServer(); // tell FalixNodes to start the server
+      wakeServer();
     } else {
       serverOnline = true;
       log(`❌ Error on ${host}:${port}: ${err.message}`);
     }
     failStreak++;
-    nextServer(); // rotate to next address
+    nextServer();
     cleanup();
     scheduleReconnect();
   });
@@ -407,7 +242,7 @@ function createBot() {
   bot.on('end', (reason) => {
     log(`🔌 Disconnected from ${currentServer().host}:${currentServer().port}: ${reason || 'unknown'}`);
     failStreak++;
-    nextServer(); // rotate to next address
+    nextServer();
     cleanup();
     scheduleReconnect();
   });
@@ -417,8 +252,6 @@ function createBot() {
 
 function cleanup() {
   stopAntiAfk();
-  stopCombat(true);
-  stopPvpScan();
   stopStatusLogger();
   if (bot) {
     try { bot.removeAllListeners(); } catch (_) {}
@@ -444,7 +277,6 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ─── HTTP Status Server ───────────────────────────────────────────────────────
-// Handles ALL paths so Render health checks (/healthz, /, etc.) all return 200.
 
 const server = http.createServer((req, res) => {
   const upSec  = Math.floor((Date.now() - startTime) / 1000);
@@ -453,30 +285,27 @@ const server = http.createServer((req, res) => {
 
   const { host, port } = currentServer();
   const body = JSON.stringify({
-    status:    bot && bot.entity ? 'ONLINE' : (serverOnline ? 'RECONNECTING' : 'SERVER_DOWN'),
-    server:    `${host}:${port}`,
-    trying:    `${serverIndex + 1}/${SERVERS.length}`,
+    status:     bot && bot.entity ? 'ONLINE' : (serverOnline ? 'RECONNECTING' : 'SERVER_DOWN'),
+    server:     `${host}:${port}`,
+    trying:     `${serverIndex + 1}/${SERVERS.length}`,
     allServers: SERVERS.map(s => `${s.host}:${s.port}`),
-    username:  USERNAME,
-    pvpMode,
-    health:    bot && bot.health != null ? bot.health.toFixed(1) : '?',
-    food:      bot && bot.food   != null ? String(bot.food)      : '?',
-    target:    currentTarget ? (currentTarget.username || currentTarget.type) : 'none',
+    username:   USERNAME,
+    health:     bot && bot.health != null ? bot.health.toFixed(1) : '?',
+    food:       bot && bot.food   != null ? String(bot.food)      : '?',
     failStreak,
-    nextRetry: reconnectTimer ? `${getReconnectDelay() / 1000}s` : 'connected',
+    nextRetry:  reconnectTimer ? `${getReconnectDelay() / 1000}s` : 'connected',
     uptime,
   }, null, 2);
 
   res.writeHead(200, {
-    'Content-Type':  'application/json',
-    'Cache-Control': 'no-cache',
+    'Content-Type':   'application/json',
+    'Cache-Control':  'no-cache',
     'Content-Length': Buffer.byteLength(body),
   });
   res.end(body);
 });
 
 server.on('error', (err) => log(`🌐 HTTP server error: ${err.message}`));
-
 server.listen(HTTP_PORT, '0.0.0.0', () => log(`🌐 Status server on 0.0.0.0:${HTTP_PORT}`));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
