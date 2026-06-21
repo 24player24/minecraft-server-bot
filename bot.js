@@ -74,23 +74,143 @@ function wakeServer() {
 
 // ─── FalixNodes Verification Link ─────────────────────────────────────────────
 
-function verifyFalix(url) {
-  log(`🔐 Verifying FalixNodes link: ${url}`);
-  const lib = url.startsWith('https') ? https : http;
-  lib.get(url, (res) => {
-    log(`🔐 Verification response: HTTP ${res.statusCode} ✅`);
-    res.resume();
-  }).on('error', (err) => {
-    log(`🔐 Verification request failed: ${err.message}`);
+// Follow up to 5 redirects and return final response + body
+function fetchFollow(url, options = {}, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) return reject(new Error('Too many redirects'));
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, options, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        const next = res.headers.location.startsWith('http')
+          ? res.headers.location
+          : new URL(res.headers.location, url).href;
+        return resolve(fetchFollow(next, options, redirects + 1));
+      }
+      const cookies = (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, body, cookies, finalUrl: url }));
+    });
+    req.on('error', reject);
   });
 }
 
-function checkMessageForVerification(text) {
+function httpPost(url, body, cookies) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const lib = url.startsWith('https') ? https : http;
+    const buf = Buffer.from(body, 'utf8');
+    const req = lib.request({
+      hostname: parsed.hostname,
+      path:     parsed.pathname + parsed.search,
+      method:   'POST',
+      headers: {
+        'Content-Type':   'application/x-www-form-urlencoded',
+        'Content-Length': buf.length,
+        'Cookie':         cookies,
+        'User-Agent':     'Mozilla/5.0',
+        'Referer':        url,
+      },
+    }, (res) => {
+      res.resume();
+      resolve(res.statusCode);
+    });
+    req.on('error', reject);
+    req.write(buf);
+    req.end();
+  });
+}
+
+function parseForm(html, baseUrl) {
+  // Extract form action
+  const formMatch = html.match(/<form[^>]+>/i);
+  if (!formMatch) return null;
+  const formTag = formMatch[0];
+  const actionMatch = formTag.match(/action="([^"]*)"/i);
+  let action = actionMatch ? actionMatch[1] : baseUrl;
+  // Make absolute
+  if (action && !action.startsWith('http')) {
+    action = new URL(action, baseUrl).href;
+  }
+  if (!action) action = baseUrl;
+
+  // Extract all input fields (hidden + submit value)
+  const fields = {};
+  const inputRe = /<input([^>]*)>/gi;
+  let m;
+  while ((m = inputRe.exec(html)) !== null) {
+    const attrs = m[1];
+    const nameM  = attrs.match(/name="([^"]*)"/i);
+    const valueM = attrs.match(/value="([^"]*)"/i);
+    const typeM  = attrs.match(/type="([^"]*)"/i);
+    if (nameM) {
+      // include all types except reset; include submit so the button is "clicked"
+      const type = typeM ? typeM[1].toLowerCase() : 'text';
+      if (type !== 'reset') fields[nameM[1]] = valueM ? valueM[1] : '';
+    }
+  }
+  return { action, fields };
+}
+
+async function verifyFalix(url) {
+  log(`🔐 Loading verification page: ${url}`);
+  try {
+    // Step 1 — load the page
+    const { status, body, cookies, finalUrl } = await fetchFollow(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    log(`🔐 Page loaded: HTTP ${status} (${finalUrl})`);
+
+    // Step 2 — find the form/button
+    const form = parseForm(body, finalUrl);
+    if (!form) {
+      log(`🔐 No form found on page — verification may already be complete (HTTP ${status})`);
+      return;
+    }
+    log(`🔐 Found form → POST ${form.action} | fields: ${JSON.stringify(form.fields)}`);
+
+    // Step 3 — submit the form (click the button)
+    const postBody = new URLSearchParams(form.fields).toString();
+    const postStatus = await httpPost(form.action, postBody, cookies);
+    log(`🔐 Form submitted: HTTP ${postStatus} ✅ — server verified!`);
+  } catch (err) {
+    log(`🔐 Verification failed: ${err.message}`);
+  }
+}
+
+// Recursively walk a prismarine-chat JSON component and collect all clickEvent URLs
+function extractClickUrls(obj, found = []) {
+  if (!obj || typeof obj !== 'object') return found;
+  if (obj.clickEvent && obj.clickEvent.action === 'open_url' && obj.clickEvent.value) {
+    found.push(obj.clickEvent.value);
+  }
+  if (Array.isArray(obj.extra)) {
+    for (const child of obj.extra) extractClickUrls(child, found);
+  }
+  if (Array.isArray(obj)) {
+    for (const child of obj) extractClickUrls(child, found);
+  }
+  return found;
+}
+
+function isFalixUrl(url) {
+  return url.includes('falixnodes.net') || url.includes('falix.host') || url.includes('falix.gg');
+}
+
+// Check plain text for verification URLs (fallback)
+function checkTextForVerification(text) {
   const match = text.match(/https?:\/\/[^\s"'<>]+/i);
   if (!match) return;
-  const url = match[0];
-  if (url.includes('falixnodes.net') || url.includes('falix.host') || url.includes('falix.gg')) {
-    verifyFalix(url);
+  if (isFalixUrl(match[0])) verifyFalix(match[0]);
+}
+
+// Check a raw JSON chat component for clickable button URLs (primary method)
+function checkJsonForVerification(jsonObj) {
+  const urls = extractClickUrls(jsonObj);
+  for (const url of urls) {
+    if (isFalixUrl(url)) verifyFalix(url);
   }
 }
 
@@ -201,14 +321,16 @@ function createBot() {
     if (username === bot.username) return;
     log(`<${username}> ${message}`);
     handleCommand(username, message);
-    checkMessageForVerification(message);
+    checkTextForVerification(message);
   });
 
   bot.on('message', (jsonMsg) => {
     const text = jsonMsg.toString();
-    if (!text) return;
-    log(`[SERVER] ${text}`);
-    checkMessageForVerification(text);
+    if (text) log(`[SERVER] ${text}`);
+    // Primary: extract clickable button URLs from the JSON component
+    checkJsonForVerification(jsonMsg.json);
+    // Fallback: also scan plain text in case URL appears as text
+    if (text) checkTextForVerification(text);
   });
 
   bot.on('kicked', (reason) => {
