@@ -87,6 +87,32 @@ function wakeServer() {
   });
 }
 
+// ─── FalixNodes Verification Link ─────────────────────────────────────────────
+
+// FalixNodes sends a verification URL in chat to confirm a real player is present.
+// The bot extracts it and GETs it automatically to keep the server alive.
+function verifyFalix(url) {
+  log(`🔐 Verifying FalixNodes link: ${url}`);
+  const lib = url.startsWith('https') ? https : http;
+  lib.get(url, (res) => {
+    log(`🔐 Verification response: HTTP ${res.statusCode} ✅`);
+    res.resume();
+  }).on('error', (err) => {
+    log(`🔐 Verification request failed: ${err.message}`);
+  });
+}
+
+function checkMessageForVerification(text) {
+  // Match any http/https URL in the message
+  const match = text.match(/https?:\/\/[^\s"'<>]+/i);
+  if (!match) return;
+  const url = match[0];
+  // Only handle FalixNodes verification links
+  if (url.includes('falixnodes.net') || url.includes('falix.host') || url.includes('falix.gg')) {
+    verifyFalix(url);
+  }
+}
+
 // ─── Anti-AFK ─────────────────────────────────────────────────────────────────
 
 function startAntiAfk() {
@@ -336,6 +362,16 @@ function createBot() {
     if (username === bot.username) return;
     log(`<${username}> ${message}`);
     handleCommand(username, message);
+    checkMessageForVerification(message); // catch verification links sent as player chat
+  });
+
+  // ── System / server messages (FalixNodes verification links come through here) ─
+
+  bot.on('message', (jsonMsg) => {
+    const text = jsonMsg.toString();
+    if (!text) return;
+    log(`[SERVER] ${text}`);
+    checkMessageForVerification(text);
   });
 
   // ── Disconnection events ────────────────────────────────────────────────────
