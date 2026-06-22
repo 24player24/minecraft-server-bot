@@ -11,7 +11,7 @@ const SERVERS = [
   { host: 'villain.falixsrv.me', port: 20092 },
 ];
 
-const USERNAME  = 'StayAliveBot';
+const USERNAME  = 'Sayimonlime';
 const HTTP_PORT = parseInt(process.env.PORT || '3000', 10);
 
 const ANTI_AFK_MS       = 30_000;
